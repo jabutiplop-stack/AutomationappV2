@@ -1,0 +1,4 @@
+# Pozostałe pliki do ignorowania
+node_modules/
+dist/
+.env

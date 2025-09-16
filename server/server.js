@@ -4,7 +4,7 @@ import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import csrf from 'csurf';
 import { securityMiddleware } from './security.js';
-
+import path from 'path';
 import authRouter from './routes/auth.js';
 import panelRouter from './routes/panel.js';
 import contactRouter from './routes/contact.js';
@@ -46,6 +46,15 @@ app.use('/api/contact', contactRouter);
 
 import adminUsersRouter from './routes/admin.users.js';
 app.use('/api/admin', adminUsersRouter);
+
+
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../client/build')));
+
+  app.get('*', (req, res) => {
+      res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
+  });
+}
 
 // globalny handler błędów
 app.use((err, _req, res, _next) => {
