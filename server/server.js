@@ -1,16 +1,17 @@
-// server/index.js
-require('dotenv').config({ override: true, quiet: true });
+// server/server.js  (ESM)
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import pkg from 'pg';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const { Pool } = pkg;
 
 const app = express();
 
 // ====== KONFIG ======
-const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
+const PORT = Number(process.env.PORT || 4000);
 const DATABASE_URL = process.env.DATABASE_URL; // np. postgresql://rootdb:super_tajne_haslo@127.0.0.1:5432/automationapp
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const ALLOWED = new Set([
@@ -39,7 +40,7 @@ if (!DATABASE_URL) {
 }
 const pool = new Pool({ connectionString: DATABASE_URL });
 
-// ====== HEALTHCHECK ======
+// ====== HEALTH ======
 app.get('/api/health', async (_req, res) => {
   try {
     const r = await pool.query('select 1 as ok');
@@ -51,38 +52,39 @@ app.get('/api/health', async (_req, res) => {
 });
 
 // ====== LOGIN ======
-/**
- * Oczekuje: { "email": "...", "password": "..." }
- * Tabela: users (kolumna na hasło: 'password' ALBO 'password_hash')
- */
+// Oczekuje: { email, password }
+// Wspiera kolumnę 'password_hash' lub 'password' w tabeli users.
 app.post('/api/auth/login', async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ message: 'Brak danych logowania' });
 
-    const q =
-      'SELECT id, email, password, password_hash FROM public.users WHERE email = $1 LIMIT 1';
-    const { rows } = await pool.query(q, [email.toLowerCase()]);
+    const { rows } = await pool.query(
+      'SELECT id, email, password, password_hash FROM public.users WHERE email = $1 LIMIT 1',
+      [email.toLowerCase()]
+    );
     const user = rows[0];
     if (!user) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
 
-    const hash = user.password_hash || user.password; // wspieramy obie nazwy kolumn
+    const hash = user.password_hash || user.password;
     if (!hash) return res.status(500).json({ message: 'Brak kolumny z hasłem w users' });
 
-    const ok = await bcrypt.compare(password, String(hash));
+    const ok = await bcrypt.compare(String(password), String(hash));
     if (!ok) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
 
     const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
 
-    // jeśli używasz cookie na froncie:
-    res.cookie?.('auth', token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000,
-    });
+    // Jeśli front używa cookie:
+    if (res.cookie) {
+      res.cookie('auth', token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000,
+      });
+    }
 
-    return res.json({ token }); // albo pusta 200 jeśli tylko cookie
+    res.json({ token });
   } catch (err) {
     next(err);
   }
@@ -90,7 +92,7 @@ app.post('/api/auth/login', async (req, res, next) => {
 
 // ====== GLOBAL ERROR ======
 app.use((err, _req, res, _next) => {
-  console.error('ERR', err);
+  console.error(err);
   res.status(err.status || 500).json({ message: 'Internal error' });
 });
 
@@ -98,3 +100,5 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`API on http://localhost:${PORT}`);
 });
+
+export default app;
