@@ -1,66 +1,100 @@
-// AutomationappV2/server/server.js
-import express from 'express';
-import cookieParser from 'cookie-parser';
-import dotenv from 'dotenv';
-import csrf from 'csurf';
-import { securityMiddleware } from './security.js';
-import path from 'path';
-import authRouter from './routes/auth.js';
-import panelRouter from './routes/panel.js';
-import contactRouter from './routes/contact.js';
+// server/index.js
+require('dotenv').config({ override: true, quiet: true });
 
-// 👉 sesje tylko w Postgresie (bez Redisa)
-import { setSession, getSession, delSession } from './sessions.js';
-
-dotenv.config();
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-app.set('trust proxy', 'loopback');
+
+// ====== KONFIG ======
+const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
+const DATABASE_URL = process.env.DATABASE_URL; // np. postgresql://rootdb:super_tajne_haslo@127.0.0.1:5432/automationapp
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
+const ALLOWED = new Set([
+  'https://cracovautomationhub.pl',
+  'https://www.cracovautomationhub.pl',
+]);
+
+// ====== PROXY / PARSERY / CORS ======
+app.set('trust proxy', 1);
 app.use(express.json());
-app.use(cookieParser(process.env.COOKIE_SECRET));
-securityMiddleware(app);
+app.use(express.urlencoded({ extended: true }));
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin || ALLOWED.has(origin)) return cb(null, true);
+      return cb(new Error('CORS blocked'));
+    },
+    credentials: true,
+  })
+);
 
-// udostępnij helpery sesji w req.ctx (jedna definicja!)
-app.use((req, _res, next) => {
-  req.ctx = { setSession, getSession, delSession };
-  next();
-});
-
-// CSRF token (opcjonalnie wymagaj 'csrf-token' przy mutacjach)
-const csrfProtection = csrf({
-  cookie: {
-    httpOnly: true,
-    sameSite: 'strict',
-    secure: process.env.NODE_ENV === 'production',
-  },
-});
-app.get('/api/csrf', csrfProtection, (req, res) => {
-  res.json({ csrfToken: req.csrfToken() });
-});
-
-// trasy API
-app.get('/api/health', (_, res) => res.json({ ok: true }));
-app.use('/api/auth', authRouter);
-app.use('/api/panel', panelRouter);
-app.use('/api/contact', contactRouter);
-
-import adminUsersRouter from './routes/admin.users.js';
-app.use('/api/admin', adminUsersRouter);
-
-
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, '../client/build')));
-
-  app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
-  });
+// ====== PG ======
+if (!DATABASE_URL) {
+  console.error('❌ Brak DATABASE_URL w .env');
+  process.exit(1);
 }
+const pool = new Pool({ connectionString: DATABASE_URL });
 
-// globalny handler błędów
-app.use((err, _req, res, _next) => {
-  console.error('ERR', err?.stack || err);
-  res.status(500).json({ error: 'Błąd serwera' });
+// ====== HEALTHCHECK ======
+app.get('/api/health', async (_req, res) => {
+  try {
+    const r = await pool.query('select 1 as ok');
+    res.json({ ok: r.rows[0].ok === 1 });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false });
+  }
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`API on http://localhost:${PORT}`));
+// ====== LOGIN ======
+/**
+ * Oczekuje: { "email": "...", "password": "..." }
+ * Tabela: users (kolumna na hasło: 'password' ALBO 'password_hash')
+ */
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ message: 'Brak danych logowania' });
+
+    const q =
+      'SELECT id, email, password, password_hash FROM public.users WHERE email = $1 LIMIT 1';
+    const { rows } = await pool.query(q, [email.toLowerCase()]);
+    const user = rows[0];
+    if (!user) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
+
+    const hash = user.password_hash || user.password; // wspieramy obie nazwy kolumn
+    if (!hash) return res.status(500).json({ message: 'Brak kolumny z hasłem w users' });
+
+    const ok = await bcrypt.compare(password, String(hash));
+    if (!ok) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
+
+    const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
+
+    // jeśli używasz cookie na froncie:
+    res.cookie?.('auth', token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return res.json({ token }); // albo pusta 200 jeśli tylko cookie
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ====== GLOBAL ERROR ======
+app.use((err, _req, res, _next) => {
+  console.error('ERR', err);
+  res.status(err.status || 500).json({ message: 'Internal error' });
+});
+
+// ====== START ======
+app.listen(PORT, () => {
+  console.log(`API on http://localhost:${PORT}`);
+});
