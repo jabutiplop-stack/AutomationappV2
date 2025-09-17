@@ -1,108 +1,86 @@
-// server/server.js  (ESM)
-import 'dotenv/config';
 import express from 'express';
+import dotenv from 'dotenv';
 import cors from 'cors';
-import pkg from 'pg';
-import bcrypt from 'bcryptjs';         // bezkompilacyjny bcrypt
+import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import User from './models/User.js';
 
-const { Pool } = pkg;
+dotenv.config();
 
 const app = express();
-
-// ===== KONFIG =====
-const PORT = Number(process.env.PORT || 4000);
-const DATABASE_URL = process.env.DATABASE_URL; // np. postgresql://rootdb:super_tajne_haslo@127.0.0.1:5432/automationapp
-const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
-const ALLOWED = new Set([
-  'https://cracovautomationhub.pl',
-  'https://www.cracovautomationhub.pl',
-]);
-
-// ===== PROXY / PARSERY / CORS =====
-app.set('trust proxy', 1);
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin || ALLOWED.has(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked'));
-  },
-  credentials: true,
-}));
+app.use(cors());
 
-// ===== PG (z krótkimi timeoutami) =====
-let pool = null;
-if (DATABASE_URL) {
-  pool = new Pool({
-    connectionString: DATABASE_URL,
-    // jeśli DB nie odpowiada, nie wieszaj requestu
-    connectionTimeoutMillis: 3000,
-    idleTimeoutMillis: 10000,
-    max: 10,
-  });
-  pool.on('error', (err) => {
-    console.error('[PG pool error]', err);
-  });
-} else {
-  console.error('❌ Brak DATABASE_URL w .env');
-}
+// Ta asynchroniczna funkcja najpierw łączy się z bazą danych,
+// a dopiero potem uruchamia serwer.
+const startServer = async () => {
+    try {
+        await mongoose.connect(process.env.MONGO_URI);
+        console.log('Połączono z bazą danych!');
 
-// ===== PING (nie dotyka DB — do szybkiej diagnostyki) =====
-app.get('/api/ping', (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+        // Trasy (routes) API
+        app.get('/api/users', async (req, res) => {
+            const users = await User.find({});
+            res.status(200).json(users);
+        });
 
-// ===== HEALTH (dotyka DB) =====
-app.get('/api/health', async (_req, res) => {
-  if (!pool) return res.status(500).json({ ok: false, error: 'no-db' });
-  try {
-    // Per-query timeout też ustawiamy krótki
-    const r = await pool.query({ text: 'select 1 as ok', statement_timeout: 3000 });
-    res.json({ ok: r.rows[0]?.ok === 1 });
-  } catch (e) {
-    console.error('[HEALTH DB ERROR]', e);
-    res.status(500).json({ ok: false, error: 'db', code: e.code || null });
-  }
-});
+        app.post('/api/register', async (req, res) => {
+            // Logika rejestracji
+            const { username, email, password } = req.body;
+            if (!username || !email || !password) {
+                return res.status(400).json({ error: 'Please enter all fields' });
+            }
 
-// ===== LOGIN (wspiera password_hash lub password) =====
-app.post('/api/auth/login', async (req, res, next) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ message: 'Brak danych logowania' });
-    if (!pool) return res.status(500).json({ message: 'DB not ready' });
+            const existingUser = await User.findOne({ email });
+            if (existingUser) {
+                return res.status(400).json({ error: 'User already exists' });
+            }
 
-    const { rows } = await pool.query(
-      'SELECT id, email, password, password_hash FROM public.users WHERE email = $1 LIMIT 1',
-      [String(email).toLowerCase()]
-    );
-    const user = rows[0];
-    if (!user) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
+            const salt = await bcrypt.genSalt(10);
+            const hashedPassword = await bcrypt.hash(password, salt);
 
-    const hash = user.password_hash || user.password;
-    if (!hash) return res.status(500).json({ message: 'Brak kolumny z hasłem w users' });
+            const newUser = new User({
+                username,
+                email,
+                password: hashedPassword
+            });
 
-    const ok = await bcrypt.compare(String(password), String(hash));
-    if (!ok) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
+            const savedUser = await newUser.save();
+            res.status(201).json({ message: 'User registered successfully' });
+        });
 
-    const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
+        app.post('/api/login', async (req, res) => {
+            // Logika logowania
+            const { email, password } = req.body;
+            if (!email || !password) {
+                return res.status(400).json({ error: 'Please enter all fields' });
+            }
 
-    res.json({ token }); // jeśli używasz cookie — można tu też setCookie
-  } catch (err) {
-    next(err);
-  }
-});
+            const user = await User.findOne({ email });
+            if (!user) {
+                return res.status(400).json({ error: 'User does not exist' });
+            }
 
-// ===== GLOBAL ERROR =====
-app.use((err, _req, res, _next) => {
-  console.error('[GLOBAL ERROR]', err);
-  res.status(err.status || 500).json({ message: 'Internal error' });
-});
+            const isMatch = await bcrypt.compare(password, user.password);
+            if (!isMatch) {
+                return res.status(400).json({ error: 'Invalid credentials' });
+            }
 
-// ===== START =====
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`API on http://localhost:${PORT}`);
-});
+            const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
-export default app;
+            res.status(200).json({ token, user: { id: user._id, username: user.username } });
+        });
+
+        const PORT = process.env.PORT || 4000;
+        app.listen(PORT, () => console.log(`API on http://localhost:${PORT}`));
+
+    } catch (e) {
+        // Jeśli połączenie z bazą danych nie powiedzie się,
+        // zostanie zgłoszony błąd i proces się zakończy.
+        console.error('Błąd połączenia z bazą danych:', e);
+        process.exit(1);
+    }
+};
+
+startServer();
