@@ -3,14 +3,14 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import pkg from 'pg';
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcryptjs';         // bezkompilacyjny bcrypt
 import jwt from 'jsonwebtoken';
 
 const { Pool } = pkg;
 
 const app = express();
 
-// ====== KONFIG ======
+// ===== KONFIG =====
 const PORT = Number(process.env.PORT || 4000);
 const DATABASE_URL = process.env.DATABASE_URL; // np. postgresql://rootdb:super_tajne_haslo@127.0.0.1:5432/automationapp
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
@@ -19,49 +19,63 @@ const ALLOWED = new Set([
   'https://www.cracovautomationhub.pl',
 ]);
 
-// ====== PROXY / PARSERY / CORS ======
+// ===== PROXY / PARSERY / CORS =====
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin || ALLOWED.has(origin)) return cb(null, true);
-      return cb(new Error('CORS blocked'));
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || ALLOWED.has(origin)) return cb(null, true);
+    return cb(new Error('CORS blocked'));
+  },
+  credentials: true,
+}));
 
-// ====== PG ======
-if (!DATABASE_URL) {
+// ===== PG (z krótkimi timeoutami) =====
+let pool = null;
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    // jeśli DB nie odpowiada, nie wieszaj requestu
+    connectionTimeoutMillis: 3000,
+    idleTimeoutMillis: 10000,
+    max: 10,
+  });
+  pool.on('error', (err) => {
+    console.error('[PG pool error]', err);
+  });
+} else {
   console.error('❌ Brak DATABASE_URL w .env');
-  process.exit(1);
 }
-const pool = new Pool({ connectionString: DATABASE_URL });
 
-// ====== HEALTH ======
+// ===== PING (nie dotyka DB — do szybkiej diagnostyki) =====
+app.get('/api/ping', (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
+
+// ===== HEALTH (dotyka DB) =====
 app.get('/api/health', async (_req, res) => {
+  if (!pool) return res.status(500).json({ ok: false, error: 'no-db' });
   try {
-    const r = await pool.query('select 1 as ok');
-    res.json({ ok: r.rows[0].ok === 1 });
+    // Per-query timeout też ustawiamy krótki
+    const r = await pool.query({ text: 'select 1 as ok', statement_timeout: 3000 });
+    res.json({ ok: r.rows[0]?.ok === 1 });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false });
+    console.error('[HEALTH DB ERROR]', e);
+    res.status(500).json({ ok: false, error: 'db', code: e.code || null });
   }
 });
 
-// ====== LOGIN ======
-// Oczekuje: { email, password }
-// Wspiera kolumnę 'password_hash' lub 'password' w tabeli users.
+// ===== LOGIN (wspiera password_hash lub password) =====
 app.post('/api/auth/login', async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ message: 'Brak danych logowania' });
+    if (!pool) return res.status(500).json({ message: 'DB not ready' });
 
     const { rows } = await pool.query(
       'SELECT id, email, password, password_hash FROM public.users WHERE email = $1 LIMIT 1',
-      [email.toLowerCase()]
+      [String(email).toLowerCase()]
     );
     const user = rows[0];
     if (!user) return res.status(401).json({ message: 'Nieprawidłowy login lub hasło' });
@@ -74,30 +88,20 @@ app.post('/api/auth/login', async (req, res, next) => {
 
     const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
 
-    // Jeśli front używa cookie:
-    if (res.cookie) {
-      res.cookie('auth', token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: 'lax',
-        maxAge: 24 * 60 * 60 * 1000,
-      });
-    }
-
-    res.json({ token });
+    res.json({ token }); // jeśli używasz cookie — można tu też setCookie
   } catch (err) {
     next(err);
   }
 });
 
-// ====== GLOBAL ERROR ======
+// ===== GLOBAL ERROR =====
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  console.error('[GLOBAL ERROR]', err);
   res.status(err.status || 500).json({ message: 'Internal error' });
 });
 
-// ====== START ======
-app.listen(PORT, () => {
+// ===== START =====
+app.listen(PORT, '127.0.0.1', () => {
   console.log(`API on http://localhost:${PORT}`);
 });
 
